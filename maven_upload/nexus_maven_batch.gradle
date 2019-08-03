@@ -1,0 +1,218 @@
+final MAVEN_CONFIG_PATH = "$MAVEN_UPLOAD_DIR/nexus_maven_config.properties"
+final SNAPSHOT = '-SNAPSHOT'
+final EXCEPTION_MODULE = 'EXCEPTION_MODULE'
+
+/**
+ *  ********** 批量打包上传脚本，发布到maven服务器 **********
+ *
+ *  >>> 使用方式： ./gradlew uploadBatch
+ *
+ *  >>> 可选参数：-PM=TDFCommonModule, -PD,  -PL
+ *
+ *  >>> 参数解释: -PM：指定打包模块名称(不指定PM参数将全量打包) -PD：snapshot -PL：增加系统日志输出
+ *
+ *  >>> 模块配置：需要打成jar的模块，需要再nexus_maven_config.properties配置模块信息，存在该配置文件中的模块将参与脚本执行
+ *
+ *  >>> 打包流程：例：执行TDFCommonModule，脚本将这个模块的所有父节点及父节点中的所有子节点排列出一个打包列表，列表内所有模块上传(不包含所有模块)
+ *
+ *  >>> 版本管理：使用三位数版本号(初始化版本为：1.0.0)，循环执行上传，因此再每执行成功一个模块时，该配置文件中的版本号默认升级
+ *
+ *  >>> 异常处理：脚本过程中的异常处理，当发生异常中断时，不要慌！！！脚本会记录发生错误的位置，当你修改完错误后，重新执行该命令(命令执行必须和上一次保持一致)，可以从错误节点开始继续打包
+ */
+
+
+/**
+ * 获取properties中所有的仓库
+ */
+def getDefaultMavenConfig = { Properties properties ->
+    rootProject.allprojects.findAll { properties.containsKey(it.name) }.stream().map {
+        it.name
+    }.collect()
+}
+
+/**
+ * 构建父节点
+ * @param depMap 依赖图
+ * @param startNodes 被查找的节点
+ * @param nodes 依赖树
+ */
+def parentDepSort(Map depMap, List startNodes, List nodes) {
+    println ">>>>>> ${startNodes}"
+    for (node in startNodes) {
+        def deps = depMap.findAll { key, value -> value.contains node }.keySet()
+        if (deps.isEmpty()) {
+            if (!nodes.contains(node)) {
+                nodes.add(0, node)
+                println " 头部添加节点：${node}"
+            }
+            continue
+        }
+        println ">>>>>> 分析节点：${node} 节点中是否存在父节点：${deps}"
+        parentDepSort(depMap, deps as List, nodes)
+        if (nodes.contains(node)) {
+            continue
+        }
+        // [base, ManagerCommonAdpater, ManagerPageFrame, TDFCommonModule]
+        def max = deps.max { nodes.indexOf(it) }
+        def i = nodes.indexOf(max)
+        nodes.add(i.next(), node)
+    }
+}
+
+/**
+ * 构建子节点
+ * @param depMap 依赖图
+ * @param parentNodes 当前打包模块的所有父节点
+ * @param nodes 依赖树
+ */
+def childDepSort(Map depMap, List parentNodes, List nodes) {
+    println ">>>>>> ${parentNodes}"
+    //分析父节点中的所有子节点，排序到依赖树中
+    for (node in parentNodes) {
+        def deps = depMap.get(node)
+        //如果当前节点没有子节点，说明是最底层节点，添加到tree末尾
+        if (deps.isEmpty()) {
+            if (!nodes.contains(node)) {
+                nodes.add node
+                println " 尾部添加节点：${node}"
+            }
+            continue
+        }
+        println ">>>>>> 分析节点：${node} 节点中是否存在节点：${deps}"
+        //节点还在，切存在子节点
+        childDepSort(depMap, deps, nodes)
+        if (nodes.contains(node)) {
+            continue
+        }
+        def min = deps.min { nodes.indexOf(it) }
+        def i = nodes.indexOf(min)
+        nodes.add(i, node)
+    }
+}
+
+/**
+ * @origins 所有的模块* @depMap 这个存放所有的依赖关系
+ */
+def generateModuleDep = { List origins ->
+    def depMap = [:]
+    def depType = [JavaPlugin.API_CONFIGURATION_NAME, JavaPlugin.IMPLEMENTATION_CONFIGURATION_NAME, JavaPlugin.COMPILE_CONFIGURATION_NAME]
+    //遍历所有仓库，获取当前仓库的所有父节点
+    origins.each { origin ->
+        //每一个仓库的依赖了哪些仓库
+        def deps = []
+        def moduleProject = rootProject.childProjects[origin]
+        moduleProject.configurations.findAll {
+            depType.contains(it.name)
+        }.collect {
+            it.dependencies.all { dep ->
+                def depName = dep.name
+                if (origins.contains(depName)) {
+                    deps.push depName
+                }
+            }
+        }
+        depMap.put(moduleProject.name, deps)
+    }
+    println "depMap " + depMap
+    depMap
+}
+
+
+def tryBeforeNode = { String moduleName, Properties properties, List nodes ->
+    def value = properties[EXCEPTION_MODULE]
+    if (!value.isEmpty()) {
+        def values = value.split('_')
+        if (moduleName == values[0] && properties[moduleName] == values[1]) {
+            //找到发生错误模块的index
+            def index = nodes.indexOf(values[2])
+            nodes.removeAll nodes[0..<index]
+        }
+    }
+}
+
+def getNewVersion = { oldVersion ->
+    println "oldVersion：${oldVersion}"
+    oldVersion -= SNAPSHOT
+    def versions = oldVersion.tokenize(".") //[0, 0, 1]
+    versions.add "${versions.pop().toInteger().next()}"
+    def newVersion = versions.join('.')
+    def isSnapShot = project.hasProperty('D')
+    if (isSnapShot) {
+        newVersion += SNAPSHOT
+    }
+    println "newVersion：${newVersion}"
+    newVersion
+}
+
+def writeProperties = { param, properties, propertiesFile ->
+    param.each { key, value ->
+        properties.setProperty(key, value)
+    }
+    properties.store(propertiesFile.newWriter(), null)
+}
+
+/**
+ * ./gradlew uploadBatch -PD
+ */
+task uploadBatch {
+    doLast {
+        def hasModule = project.hasProperty('M')
+        def properties = new SafeProperties()
+        def propertiesFile = rootProject.file(MAVEN_CONFIG_PATH)
+        propertiesFile.withInputStream {
+            stream -> properties.load stream
+        }
+        def originList = getDefaultMavenConfig properties
+        def moduleName = hasModule ? project.properties['M'] : 'all'
+        def nodes = []
+        println "开始打包===========(${moduleName})=========SNAPSHOT=${project.hasProperty('D')}"
+        def depMap = generateModuleDep originList
+        println "开始构建节点..."
+        parentDepSort(depMap, hasModule ? [moduleName] : originList, nodes)
+        if (hasModule) {
+            childDepSort(depMap, nodes.toList(), nodes)
+        }
+        nodes.reverse(true)
+        println "节点构建完成：\n${nodes}\n数量：${nodes.size}"
+        tryBeforeNode(moduleName, properties, nodes)
+        nodes.each {
+            println "正在打包：${it} 仓库..."
+            def oldVersion = properties[it]
+            def newVersion = getNewVersion(oldVersion)
+            writeProperties([(it): newVersion], properties, propertiesFile)
+            def command = "./gradlew :${it}:uploadArchives"
+            def execute = command.execute()
+            if (project.hasProperty('L')) {
+                execute.in.eachLine {
+                    println ">>>  " + it
+                }
+            }
+            def errorInputText = execute.err.text
+            if (errorInputText != '') {
+                println ">>> ${errorInputText}"
+                if (errorInputText.contains('BUILD FAILED')) {
+                    writeProperties([EXCEPTION_MODULE: "${moduleName}_${properties.get(moduleName)}_${it}", (it): oldVersion], properties, propertiesFile)
+                    throw new GradleException("${errorInputText}")
+                }
+            }
+        }
+
+        if (!properties[EXCEPTION_MODULE].isEmpty()) {
+            writeProperties([EXCEPTION_MODULE: ""], properties, propertiesFile)
+        }
+        println "执行批量打包结束：${nodes} 已全部升级"
+    }
+}
+
+class SafeProperties extends Properties {
+    private final def keys = [] as LinkedHashSet
+
+    synchronized Object put(Object key, Object value) {
+        keys.add(key)
+        super.put(key, value)
+    }
+
+    synchronized Enumeration<Object> keys() {
+        Collections.<Object> enumeration(keys)
+    }
+}

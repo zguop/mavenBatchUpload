@@ -1,0 +1,45 @@
+apply plugin: 'maven'
+final MAVEN_CONFIG_PATH = "$MAVEN_UPLOAD_DIR/nexus_maven_config.properties"
+task androidSourcesJar(type: Jar) {
+    classifier = 'sources'
+    from android.sourceSets.main.java.srcDirs
+}
+artifacts {
+    archives androidSourcesJar
+}
+uploadArchives {
+    repositories {
+        mavenDeployer {
+            def properties = new Properties()
+            rootProject.file(MAVEN_CONFIG_PATH).withInputStream {
+                stream -> properties.load(stream)
+            }
+            def version = properties.get(project.name)
+            def groupId = properties.get('GROUP_ID')
+            pom.groupId = groupId
+            pom.artifactId = project.name
+            pom.version = version
+            pom.packaging = 'aar'
+            pom.withXml {
+                it.asNode().dependencies.dependency.findAll {
+                    it.groupId.text() == rootProject.name
+                }.each {
+                    println "artifactId=${it.artifactId.text()} groupId=${it.groupId.text()}"
+                    def p = rootProject.childProjects[it.artifactId.text()]
+                    it.groupId.each {
+                        it.value = [groupId]
+                    }
+                    it.artifactId.each {
+                        it.value = [p.name]
+                    }
+                    it.version.each {
+                        it.value = [properties.get(p.name)]
+                    }
+                }
+            }
+            repository(url: version.contains("SNAPSHOT") ? properties.get('SNAPSHOT_URL') : properties.get('RELEASE_URL')) {
+                authentication(userName: properties.get('NAME'), password: properties.get('PASSWORD'))
+            }
+        }
+    }
+}
